@@ -1,0 +1,7 @@
+{
+    "miner_id": "qubic_miner_001",
+    "difficulty": 4,
+    "threads": 4,
+    "ltc_wallet": "your_ltc_wallet_address",
+    "doge_wallet": "your_doge_wallet_address"
+}
