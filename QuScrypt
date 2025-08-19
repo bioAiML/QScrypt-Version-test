@@ -1,0 +1,322 @@
+# qubic_scrypt_miner.py
+import hashlib
+import time
+import random
+import json
+import scrypt
+import logging
+import threading
+import queue
+import os
+import psutil
+import pyopencl as cl
+import numpy as np
+import requests
+import yaml
+from typing import Dict, Optional, List
+from websocket import create_connection, WebSocketException
+from concurrent.futures import ThreadPoolExecutor
+
+# Configuration
+CONFIG_PATH = "appsettings.json"
+LOG_FILE = "qubic_miner.log"
+BLOCK_TARGET_TIME = 2.5  # Seconds, Litecoin-like
+DIFFICULTY = 4  # Leading zeros
+MAX_NONCE = 2**32
+SHARD_COUNT = 16
+QUBIC_API_URL = "wss://pool.qubic.li:8008"
+QUBIC_PAYOUT_ADDRESS = "VGIWRRNVVRRXSEASPENCIMVNANPCFHAASZVPBIEFLCRYHWSZYSGXHNSBYPVN"
+
+# Logging setup
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.FileHandler(LOG_FILE),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+
+def load_config() -> Dict:
+    try:
+        with open(CONFIG_PATH, 'r') as f:
+            config = json.load(f)
+        return config
+    except FileNotFoundError:
+        logger.error("Config file not found, creating default")
+        default_config = {
+            "QubicAddress": QUBIC_PAYOUT_ADDRESS,
+            "CpuThreads": psutil.cpu_count(logical=True),
+            "GpuEnabled": True,
+            "Intensity": 14,  # Optimized for high-end GPUs
+            "ThreadConcurrency": 16384,  # Tuned for modern GPUs
+            "PpsEnabled": True,
+            "ApiUrl": QUBIC_API_URL
+        }
+        with open(CONFIG_PATH, 'w') as f:
+            json.dump(default_config, f, indent=4)
+        return default_config
+
+class ScryptMiner:
+    def __init__(self, config: Dict):
+        self.miner_id = hashlib.sha256(str(time.time()).encode()).hexdigest()[:8]
+        self.config = config
+        self.cpu_threads = config.get("CpuThreads", psutil.cpu_count(logical=True))
+        self.gpu_enabled = config.get("GpuEnabled", True)
+        self.intensity = min(max(config.get("Intensity", 14), 8), 20)
+        self.thread_concurrency = config.get("ThreadConcurrency", 16384)
+        self.pps_enabled = config.get("PpsEnabled", True)
+        self.qubic_address = config.get("QubicAddress", QUBIC_PAYOUT_ADDRESS)
+        self.api_url = config.get("ApiUrl", QUBIC_API_URL)
+        self.nonce = 0
+        self.target = "0" * DIFFICULTY
+        self.miner_hashrate = 0
+        self.task_queue = queue.Queue(maxsize=1000)
+        self.running = False
+        self.ws = None
+        self.context = None
+        self.queue_cl = None
+        self.program = None
+        self.use_opencl = False
+        self._hardware_check()
+
+    def _hardware_check(self):
+        """Perform system hardware self-check and select optimal Scrypt kernel."""
+        # CPU check
+        cpu_count = psutil.cpu_count(logical=True)
+        cpu_freq = psutil.cpu_freq().current if psutil.cpu_freq() else 2000
+        cpu_score = cpu_count * cpu_freq / 1000
+        mem_info = psutil.virtual_memory()
+        available_mem = mem_info.available / 1024**3
+
+        # GPU check
+        gpu_available = False
+        gpu_compute_units = 0
+        gpu_vram = 0
+        try:
+            platforms = cl.get_platforms()
+            if platforms:
+                device = platforms[0].get_devices()[0]
+                gpu_compute_units = device.max_compute_units
+                gpu_vram = device.global_mem_size / 1024**3
+                gpu_available = True
+                logger.info(f"GPU detected: {device.name}, {gpu_vram:.2f}GB VRAM, {gpu_compute_units} compute units")
+        except Exception as e:
+            logger.warning(f"No OpenCL GPU detected: {e}")
+
+        # Kernel selection
+        if gpu_available and gpu_vram >= 6 and gpu_compute_units >= 24 and available_mem >= 3:
+            self.use_opencl = True
+            self._init_opencl()
+            logger.info("Selected OpenCL Scrypt kernel for GPU")
+            shaders = min(gpu_compute_units * 256, 4096)  # Approx. shaders
+            self.thread_concurrency = min(self.thread_concurrency, shaders * 4)
+            self.intensity = min(self.intensity, int(gpu_vram * 2.5))
+        else:
+            self.use_opencl = False
+            self.cpu_threads = max(1, int(cpu_count * 0.8))  # Use 80% of cores
+            logger.info(f"Selected Python Scrypt kernel for CPU ({self.cpu_threads} threads)")
+
+        if available_mem < 1.5:
+            logger.warning("Low system memory (<1.5GB), reducing threads")
+            self.cpu_threads = max(1, self.cpu_threads // 2)
+            self.gpu_enabled = False
+            self.use_opencl = False
+
+    def _init_opencl(self):
+        """Initialize OpenCL and compile scrypt.cl."""
+        try:
+            platform = cl.get_platforms()[0]
+            device = platform.get_devices()[0]
+            self.context = cl.Context([device])
+            self.queue_cl = cl.CommandQueue(self.context)
+            self.program = cl.Program(self.context, open("scrypt.cl").read() if os.path.exists("scrypt.cl") else SCRYPT_KERNEL).build()
+            logger.info(f"Initialized OpenCL on {device.name}")
+        except Exception as e:
+            logger.error(f"Failed to initialize OpenCL: {e}")
+            self.gpu_enabled = False
+            self.use_opencl = False
+
+    def _scrypt_hash(self, data: str, nonce: int) -> str:
+        """Perform Scrypt hashing using selected kernel."""
+        input_data = f"{data}{nonce}".encode()
+        try:
+            if self.use_opencl and self.gpu_enabled:
+                data_buf = cl.Buffer(self.context, cl.mem_flags.READ_ONLY | cl.mem_flags.COPY_HOST_PTR, hostbuf=input_data)
+                output_buf = cl.Buffer(self.context, cl.mem_flags.WRITE_ONLY, 32 * self.thread_concurrency)
+                global_size = (self.thread_concurrency,)
+                self.program.scrypt_hash(self.queue_cl, global_size, None, data_buf, output_buf, np.uint32(nonce), np.uint32(1024), np.uint32(1), np.uint32(1))
+                output = np.zeros(32 * self.thread_concurrency, dtype=np.uint8)
+                cl.enqueue_copy(self.queue_cl, output, output_buf).wait()
+                hash_output = bytes(output[:32])
+            else:
+                hash_output = scrypt.hash(input_data, salt=input_data, N=1024, r=1, p=1, dkLen=32)
+            return hashlib.sha256(hash_output).hexdigest()
+        except Exception as e:
+            logger.error(f"Scrypt hash error: {e}")
+            return ""
+
+    def _tune_scrypt_parameters(self):
+        """Dynamically tune Scrypt parameters for speed and hash power."""
+        if self.use_opencl and self.gpu_enabled:
+            try:
+                device = self.context.devices[0]
+                shaders = device.max_compute_units * 256
+                self.thread_concurrency = min(self.thread_concurrency, shaders * 4)
+                mem_info = psutil.virtual_memory()
+                if mem_info.available < 3 * 1024**3:
+                    self.intensity = max(8, self.intensity - 2)
+                    logger.warning(f"Reduced intensity to {self.intensity} due to low memory")
+                elif self.miner_hashrate < 100:  # Low hashrate, increase intensity
+                    self.intensity = min(20, self.intensity + 1)
+                    logger.info(f"Increased intensity to {self.intensity}")
+                logger.info(f"Tuned thread-concurrency to {self.thread_concurrency}")
+            except Exception as e:
+                logger.error(f"Tuning error: {e}")
+                self.thread_concurrency = 16384
+                self.intensity = 14
+        else:
+            cpu_usage = psutil.cpu_percent()
+            if cpu_usage > 85:
+                self.cpu_threads = max(1, self.cpu_threads - 2)
+                logger.info(f"Reduced CPU threads to {self.cpu_threads} due to high load")
+            elif self.miner_hashrate < 20 and self.cpu_threads < psutil.cpu_count(logical=True):
+                self.cpu_threads += 1
+                logger.info(f"Increased CPU threads to {self.cpu_threads}")
+
+    def _connect_to_qubic(self):
+        """Establish WebSocket connection to Qubic Computor API."""
+        try:
+            self.ws = create_connection(self.api_url)
+            logger.info("Connected to Qubic API")
+            auth_message = json.dumps({"QubicAddress": self.qubic_address, "pps": self.pps_enabled})
+            self.ws.send(auth_message)
+            response = json.loads(self.ws.recv())
+            if response.get("status") == "authenticated":
+                logger.info("Authenticated with Qubic network")
+                return True
+            else:
+                logger.error("Authentication failed")
+                return False
+        except WebSocketException as e:
+            logger.error(f"WebSocket connection failed: {e}")
+            return False
+
+    def _fetch_task(self) -> Optional[Dict]:
+        """Fetch AI training task from Qubic Computor."""
+        try:
+            self.ws.send(json.dumps({"command": "fetch_task"}))
+            task = json.loads(self.ws.recv())
+            if task.get("task_id"):
+                logger.info(f"Fetched task: {task['task_id']}")
+                return task
+            else:
+                logger.warning("No task received")
+                return None
+        except Exception as e:
+            logger.error(f"Task fetch error: {e}")
+            return None
+
+    def _submit_solution(self, solution: Dict):
+        """Submit Scrypt-hashed solution to Qubic Computor."""
+        try:
+            self.ws.send(json.dumps({"command": "submit_solution", "solution": solution}))
+            response = json.loads(self.ws.recv())
+            if response.get("status") == "accepted":
+                logger.info(f"Solution accepted: {solution['hash']}")
+                return True
+            else:
+                logger.warning(f"Solution rejected: {response.get('reason')}")
+                return False
+        except Exception as e:
+            logger.error(f"Submission error: {e}")
+            return False
+
+    def mine_block(self, task: Dict) -> Optional[Dict]:
+        """Mine a block using Scrypt, combining AI task and Qubic data."""
+        start_time = time.time()
+        block_data = {
+            "task_id": task.get("task_id", ""),
+            "ai_data": task.get("ai_data", {}),
+            "miner_id": self.miner_id,
+            "epoch": task.get("epoch", 0),
+            "previous_hash": task.get("previous_hash", "")
+        }
+        block_str = json.dumps(block_data, sort_keys=True)
+        self.nonce = random.randint(0, MAX_NONCE)
+
+        while self.nonce < MAX_NONCE and self.running:
+            hash_result = self._scrypt_hash(block_str, self.nonce)
+            if hash_result.startswith(self.target):
+                solution = {
+                    "miner_id": self.miner_id,
+                    "task_id": block_data["task_id"],
+                    "nonce": self.nonce,
+                    "hash": hash_result,
+                    "timestamp": time.time(),
+                    "payout_address": self.qubic_address
+                }
+                self.miner_hashrate = 1 / (time.time() - start_time + 1e-6) * 1000
+                logger.info(f"Mined block: {hash_result}, hashrate: {self.miner_hashrate:.2f} KH/s")
+                return solution
+            self.nonce += 1
+            if time.time() - start_time > BLOCK_TARGET_TIME:
+                break
+        return None
+
+    def optimize_hardware(self):
+        """Optimize CPU/GPU usage for maximum hash power."""
+        self._tune_scrypt_parameters()
+        mem_info = psutil.virtual_memory()
+        if mem_info.available < 1.5 * 1024**3:
+            logger.warning("Low system memory (<1.5GB), switching to CPU")
+            self.gpu_enabled = False
+            self.use_opencl = False
+            self.cpu_threads = max(1, int(psutil.cpu_count(logical=True) * 0.7))
+
+    def worker_thread(self):
+        """Worker thread for mining and task processing."""
+        while self.running:
+            try:
+                task = self._fetch_task()
+                if task:
+                    self.task_queue.put(task)
+                    solution = self.mine_block(task)
+                    if solution and self._submit_solution(solution):
+                        logger.info(f"Solution submitted for task {task['task_id']}")
+                    else:
+                        logger.warning(f"Failed to mine or submit solution for task {task['task_id']}")
+                self.optimize_hardware()
+                time.sleep(0.005)
+            except Exception as e:
+                logger.error(f"Worker error: {e}")
+                time.sleep(1)
+
+    def start_mining(self):
+        """Start the mining process."""
+        if not self._connect_to_qubic():
+            logger.error("Failed to connect to Qubic network, exiting")
+            return
+        self.running = True
+        logger.info(f"Starting miner {self.miner_id} with {self.cpu_threads} threads, OpenCL: {self.use_opencl}")
+        with ThreadPoolExecutor(max_workers=self.cpu_threads) as executor:
+            for _ in range(self.cpu_threads):
+                executor.submit(self.worker_thread)
+            while self.running:
+                try:
+                    time.sleep(1)
+                except KeyboardInterrupt:
+                    logger.info("Stopping miner")
+                    self.running = False
+                    if self.ws:
+                        self.ws.close()
+
+def main():
+    config = load_config()
+    miner = ScryptMiner(config)
+    miner.start_mining()
+
+if __name__ == "__main__":
+    main()
+
