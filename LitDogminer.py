@@ -1,4 +1,5 @@
-# litecoin_dogecoin_miner.py
+# litdogminer.py
+
 import hashlib
 import time
 import json
